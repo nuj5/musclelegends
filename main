@@ -3,7 +3,7 @@
 -- stat names from the leaderboard header screenshot; reset behavior from the user's description.
 -- ASSUMED: stats live under player.leaderstats as numeric values; Onyx handles are method-style;
 -- Credits field meanings (Name / Title / Label); the Backpack instance can be replaced on respawn.
--- UNTUNED: RebirthInterval, ToolSettleTime, SettleMaxWait, ResetWaitTimeout, RecentResetWindow, server rate limits.
+-- UNTUNED: RebirthInterval, ToolSettleTime, SettleMaxWait, ResetWaitTimeout, RecentResetWindow, PostRebirthHold, server rate limits.
 
 for _, key in ipairs({ "OnyxGUI", "Potassium" }) do
     local old = getgenv()[key]
@@ -32,6 +32,7 @@ local Config = {
     SettleMaxWait        = 6,    -- UNTUNED: give up waiting for tools after this long
     ResetWaitTimeout     = 5,    -- UNTUNED: max wait for the character reset after a rebirth signal
     RecentResetWindow    = 1.5,  -- UNTUNED: a stat rise this soon after a respawn counts as already reset
+    PostRebirthHold      = 0.2,  -- UNTUNED: farm stays off the tools this long after a rebirth settles, then re-equips
     StatsFolder          = "leaderstats",                                 -- ASSUMED container
     StatNames            = { "Strength", "Rebirths", "Kills", "Brawls" }, -- from leaderboard header
     StatsInterval        = 1,
@@ -55,6 +56,8 @@ local S: { [string]: any } = {
     settling = false,          -- true from a reset signal until the new character's tools are stable
     settleReason = nil,        -- "rebirth" or "respawn"
     settleToken = 0,           -- invalidates older settle waits
+    holding = false,           -- true for PostRebirthHold seconds after a rebirth settle finishes
+    resetHit = false,          -- true once the character reset / tool refresh has actually started
     newCharSeen = false,
     lastCharAddedAt = -math.huge,
     lastToolChange = os.clock(),
@@ -63,6 +66,11 @@ local S: { [string]: any } = {
     toolsDirty = true,
     posLockPosition = Vector3.zero,
 }
+
+-- the farm stays off the tools only while the reset is really happening, or during the post-rebirth hold
+local function farmBlocked()
+    return S.holding or (S.settling and S.resetHit)
+end
 
 local R: { [string]: any } = {}    -- remotes, resolved lazily
 local UI: { [string]: any } = {}   -- Onyx control handles
@@ -139,6 +147,7 @@ local function computeStatus()
         if S.settleReason == "rebirth" then return "✦  REBIRTHING" end
         return "↻  RESPAWNING"
     end
+    if S.holding then return "⏳  RESUMING" end
     if S.currentTarget then return "▶  " .. S.currentTarget:upper() end
     return "◎  SEARCHING"
 end
@@ -274,7 +283,7 @@ local function resolveDesired()
 end
 
 local function tryEquip(name)
-    if not humanoid or not character or S.settling then
+    if not humanoid or not character or farmBlocked() then
         return nil
     end
     local inChar = findTool(character, name)
@@ -329,7 +338,7 @@ local function enforceLocks()
     if not (S.teleLock or S.posLock) then
         return
     end
-    if S.paused or S.stopped or S.settling or not character then
+    if S.paused or S.stopped or farmBlocked() or not character then
         return
     end
     local root = character:FindFirstChild("HumanoidRootPart")
@@ -360,7 +369,9 @@ local function finishSettle(token)
     if token ~= S.settleToken then
         return
     end
+    local reason = S.settleReason
     S.settling = false
+    S.resetHit = false
     S.settleReason = nil
     S.toolsDirty = true
     if S.teleLock then
@@ -368,6 +379,21 @@ local function finishSettle(token)
     end
     if S.posLock then
         snapTo(S.posLockPosition)
+    end
+
+    -- after a rebirth: hold the farm for PostRebirthHold seconds, then force a fresh equip and resume lifting
+    if reason == "rebirth" and Config.PostRebirthHold > 0 then
+        S.holding = true
+        task.spawn(function()
+            task.wait(Config.PostRebirthHold)
+            if destroyed or S.stopped then
+                return
+            end
+            S.holding = false
+            S.currentTarget = nil   -- main loop re-resolves, unequips extras and equips the weight again
+            S.toolsDirty = true
+            refreshStatus()
+        end)
     end
     refreshStatus()
 end
@@ -390,6 +416,7 @@ local function beginSettle(reason, newCharSeen)
     S.settling = true
     S.settleReason = reason
     S.newCharSeen = newCharSeen == true
+    S.resetHit = reason == "respawn" or newCharSeen == true
     S.settleToken += 1
     local token = S.settleToken
     refreshStatus()
@@ -414,6 +441,7 @@ local function bindHumanoid(hum)
         humanoidConn = nil
     end
     humanoidConn = hum.Died:Connect(function()
+        S.resetHit = true
         beginSettle("respawn", false)
     end)
 end
@@ -460,10 +488,12 @@ local function onCharacterAdded(newChar)
     bindCharacterWatchers()
     bindHumanoid(humanoid)
     S.lastCharAddedAt = os.clock()
+    S.resetHit = true
     beginSettle("respawn", true)
 end
 
 local function onCharacterRemoving()
+    S.resetHit = true
     beginSettle("respawn", false)
 end
 
@@ -480,7 +510,7 @@ local function startMainLoop()
     mainThread = task.spawn(function()
         local desired = nil
         while S.running and not S.stopped do
-            if S.settling or S.paused then
+            if farmBlocked() or S.paused then
                 task.wait(0.05)
                 continue
             end
@@ -534,7 +564,7 @@ local function startBackgroundLoops()
     -- rep spam
     table.insert(threads, task.spawn(function()
         while not S.stopped do
-            if S.running and not S.paused and not S.settling then
+            if S.running and not S.paused and not farmBlocked() then
                 R.muscle = R.muscle or player:FindFirstChild("muscleEvent")
                 if R.muscle then
                     pcall(R.muscle.FireServer, R.muscle, "rep")
@@ -589,7 +619,7 @@ local function startBackgroundLoops()
             if tickCount % Config.ReequipEvery == 0 then
                 S.toolsDirty = true
                 local target = S.currentTarget
-                if S.running and not S.settling and not S.paused
+                if S.running and not farmBlocked() and not S.paused
                     and character and target and not findTool(character, target) then
                     task.spawn(tryEquip, target)
                 end
@@ -621,6 +651,8 @@ local function stopEverything()
     S.teleLock = false
     S.posLock = false
     S.settling = false
+    S.holding = false
+    S.resetHit = false
     S.settleReason = nil
     S.settleToken += 1
     S.currentTarget = nil
