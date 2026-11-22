@@ -1,8 +1,9 @@
 -- Onyx GUI (muscle farm port). Made by JustH0bo.
 -- Sourced: functions, remotes, arguments, intervals, radii from the original script; UI calls from the Onyx README;
--- stat names from the leaderboard header screenshot.
+-- stat names from the leaderboard header screenshot; reset behavior from the user's description.
 -- ASSUMED: stats live under player.leaderstats as numeric values; Onyx handles are method-style;
--- Credits field meanings (Name / Title / Label).
+-- Credits field meanings (Name / Title / Label); the Backpack instance can be replaced on respawn.
+-- UNTUNED: RebirthInterval, ToolSettleTime, SettleMaxWait, ResetWaitTimeout, RecentResetWindow, server rate limits.
 
 for _, key in ipairs({ "OnyxGUI", "Potassium" }) do
     local old = getgenv()[key]
@@ -20,14 +21,18 @@ local Config = {
     ActivateGap          = 0.1,
     LoopStep             = 0.05,
     EquipSettle          = 0.2,
-    RespawnSettle        = 2,
     RepInterval          = 0.1,
     HousekeepingInterval = 0.5,
     ReequipEvery         = 4,    -- housekeeping ticks, 4 x 0.5s = 2s like the original
     SlowInterval         = 10,   -- gift + size
-    RebirthInterval      = 5,
     GiftSlots            = 8,
-    StatsFolder          = "leaderstats",                              -- ASSUMED container
+    RebirthInterval      = 0.25, -- UNTUNED: fixed seconds between rebirth requests (was 5)
+    RebirthStatName      = "Rebirths",
+    ToolSettleTime       = 0.5,  -- UNTUNED: tools must be unchanged this long before the farm resumes
+    SettleMaxWait        = 6,    -- UNTUNED: give up waiting for tools after this long
+    ResetWaitTimeout     = 5,    -- UNTUNED: max wait for the character reset after a rebirth signal
+    RecentResetWindow    = 1.5,  -- UNTUNED: a stat rise this soon after a respawn counts as already reset
+    StatsFolder          = "leaderstats",                                 -- ASSUMED container
     StatNames            = { "Strength", "Rebirths", "Kills", "Brawls" }, -- from leaderboard header
     StatsInterval        = 1,
 }
@@ -40,15 +45,19 @@ local backpack = player:WaitForChild("Backpack")
 local character = player.Character
 local humanoid = character and character:FindFirstChildOfClass("Humanoid")
 
-local S = {
+local S: { [string]: any } = {
     running = false,
     paused = false,
     stopped = false,
     rebirthEnabled = false,
     teleLock = false,
     posLock = false,
-    rebirthCooldown = false,
-    respawning = false,
+    settling = false,          -- true from a reset signal until the new character's tools are stable
+    settleReason = nil,        -- "rebirth" or "respawn"
+    settleToken = 0,           -- invalidates older settle waits
+    newCharSeen = false,
+    lastCharAddedAt = -math.huge,
+    lastToolChange = os.clock(),
     currentTarget = nil,
     lastActivation = 0,
     toolsDirty = true,
@@ -62,10 +71,13 @@ local threads = {}                 -- cancellable farm threads
 local mainThread = nil
 local statsThread = nil
 local bgRunning = false
-local watchConns = {}
+local backpackConns = {}
+local characterConns = {}
 local conns = {}
+local humanoidConn = nil
 local destroyed = false
 local startedAt = os.clock()
+local rebirthStat = { object = nil, last = nil, conn = nil }
 
 -- pure helpers
 local function formatNumber(n)
@@ -123,7 +135,10 @@ end
 local function computeStatus()
     if not S.running then return "● IDLE" end
     if S.paused then return "⏸  PAUSED" end
-    if S.rebirthCooldown then return "✦  REBIRTHING" end
+    if S.settling then
+        if S.settleReason == "rebirth" then return "✦  REBIRTHING" end
+        return "↻  RESPAWNING"
+    end
     if S.currentTarget then return "▶  " .. S.currentTarget:upper() end
     return "◎  SEARCHING"
 end
@@ -174,14 +189,70 @@ local function resolveRemotes()
     end
 end
 
+-- tool change watchers: Backpack and character are watched separately because the Backpack can be replaced
+local function markTools()
+    S.toolsDirty = true
+    S.lastToolChange = os.clock()
+end
+
+local function clearConns(list)
+    for _, c in ipairs(list) do
+        pcall(function() c:Disconnect() end)
+    end
+    table.clear(list)
+end
+
+local function watchContainer(container, bucket)
+    if not container then
+        return
+    end
+    local function onChange(child)
+        if child:IsA("Tool") then
+            markTools()
+        end
+    end
+    table.insert(bucket, container.ChildAdded:Connect(onChange))
+    table.insert(bucket, container.ChildRemoved:Connect(onChange))
+end
+
+local function bindBackpackWatchers()
+    clearConns(backpackConns)
+    watchContainer(backpack, backpackConns)
+    markTools()
+end
+
+local function bindCharacterWatchers()
+    clearConns(characterConns)
+    watchContainer(character, characterConns)
+    markTools()
+end
+
+-- always use the current Backpack; rebind its watchers if the instance was replaced
+local function refreshBackpack()
+    local current = player:FindFirstChildOfClass("Backpack")
+    if current and current ~= backpack then
+        backpack = current
+        bindBackpackWatchers()
+    end
+    return backpack
+end
+
 -- tool helpers
 local function findTool(parent, name)
     if not parent then
         return nil
     end
-    local child = parent:FindFirstChild(name)
-    if child and child:IsA("Tool") then
-        return child
+    local direct = parent:FindFirstChild(name)
+    if direct and direct:IsA("Tool") then
+        return direct
+    end
+    if direct then
+        -- something that is not a Tool shares the name: scan for the Tool like the original script did
+        for _, child in ipairs(parent:GetChildren()) do
+            if child.Name == name and child:IsA("Tool") then
+                return child
+            end
+        end
     end
     return nil
 end
@@ -190,7 +261,7 @@ local function isAvailable(name)
     if not character then
         return false
     end
-    return findTool(character, name) ~= nil or findTool(backpack, name) ~= nil
+    return findTool(character, name) ~= nil or findTool(refreshBackpack(), name) ~= nil
 end
 
 local function resolveDesired()
@@ -203,14 +274,14 @@ local function resolveDesired()
 end
 
 local function tryEquip(name)
-    if not humanoid or not character or S.respawning then
+    if not humanoid or not character or S.settling then
         return nil
     end
     local inChar = findTool(character, name)
     if inChar then
         return inChar
     end
-    local inBag = findTool(backpack, name)
+    local inBag = findTool(refreshBackpack(), name)
     if not inBag then
         return nil
     end
@@ -220,12 +291,13 @@ local function tryEquip(name)
 end
 
 local function unequipAllExcept(name)
-    if not character or not backpack then
+    local bag = refreshBackpack()
+    if not character or not bag then
         return
     end
     for _, item in ipairs(character:GetChildren()) do
         if item:IsA("Tool") and item.Name ~= name then
-            pcall(function() item.Parent = backpack end)
+            pcall(function() item.Parent = bag end)
         end
     end
 end
@@ -257,7 +329,7 @@ local function enforceLocks()
     if not (S.teleLock or S.posLock) then
         return
     end
-    if S.paused or S.stopped or S.respawning or not character then
+    if S.paused or S.stopped or S.settling or not character then
         return
     end
     local root = character:FindFirstChild("HumanoidRootPart")
@@ -272,49 +344,127 @@ local function enforceLocks()
     end
 end
 
--- tool change watchers (replace per-iteration scans)
-local function bindToolWatchers()
-    for _, c in ipairs(watchConns) do
-        c:Disconnect()
-    end
-    table.clear(watchConns)
-    backpack = player:FindFirstChildOfClass("Backpack") or backpack
-    local function mark()
-        S.toolsDirty = true
-    end
-    local function watch(container)
-        if not container then
-            return
+-- reset / rebirth settle gate: the farm stays off the tools until the new character's tools stop changing
+local function waitForToolsSettled(token, maxWait)
+    local startedWait = os.clock()
+    while token == S.settleToken and os.clock() - startedWait < maxWait do
+        if os.clock() - S.lastToolChange >= Config.ToolSettleTime and resolveDesired() ~= nil then
+            return true
         end
-        table.insert(watchConns, container.ChildAdded:Connect(mark))
-        table.insert(watchConns, container.ChildRemoved:Connect(mark))
+        task.wait(0.05)
     end
-    watch(backpack)
-    watch(character)
-    S.toolsDirty = true
+    return false
 end
 
--- respawn handler
-local function onCharacterAdded(newChar)
-    character = newChar
-    humanoid = newChar:WaitForChild("Humanoid")
-    S.respawning = true
-    bindToolWatchers()
-    task.wait(Config.RespawnSettle)
-    S.respawning = false
-
-    if S.running and S.currentTarget then
-        task.wait(0.5)
-        tryEquip(S.currentTarget)
+local function finishSettle(token)
+    if token ~= S.settleToken then
+        return
     end
+    S.settling = false
+    S.settleReason = nil
+    S.toolsDirty = true
     if S.teleLock then
-        task.wait(0.3)
         snapTo(Config.LockPosition)
     end
     if S.posLock then
-        task.wait(0.3)
         snapTo(S.posLockPosition)
     end
+    refreshStatus()
+end
+
+local function beginSettle(reason, newCharSeen)
+    if destroyed then
+        return
+    end
+    if S.settling then
+        if reason == "rebirth" and S.settleReason ~= "rebirth" then
+            S.settleReason = "rebirth"
+            refreshStatus()
+        end
+        if newCharSeen then
+            S.newCharSeen = true
+        end
+        return
+    end
+
+    S.settling = true
+    S.settleReason = reason
+    S.newCharSeen = newCharSeen == true
+    S.settleToken += 1
+    local token = S.settleToken
+    refreshStatus()
+
+    task.spawn(function()
+        -- phase 1: the reset has not happened yet, wait for the new character (bounded)
+        local waitStart = os.clock()
+        while token == S.settleToken and not S.newCharSeen and os.clock() - waitStart < Config.ResetWaitTimeout do
+            task.wait(0.05)
+        end
+        -- phase 2: wait until the tool set stops changing (bounded)
+        if token == S.settleToken and S.newCharSeen then
+            waitForToolsSettled(token, Config.SettleMaxWait)
+        end
+        finishSettle(token)
+    end)
+end
+
+local function bindHumanoid(hum)
+    if humanoidConn then
+        pcall(function() humanoidConn:Disconnect() end)
+        humanoidConn = nil
+    end
+    humanoidConn = hum.Died:Connect(function()
+        beginSettle("respawn", false)
+    end)
+end
+
+-- early rebirth signal: the Rebirths stat rising (ASSUMED to exist under leaderstats)
+local function bindRebirthStat()
+    local folder = player:FindFirstChild(Config.StatsFolder)
+    local object = folder and folder:FindFirstChild(Config.RebirthStatName)
+    if object == rebirthStat.object then
+        return
+    end
+    if rebirthStat.conn then
+        rebirthStat.conn:Disconnect()
+        rebirthStat.conn = nil
+    end
+    rebirthStat.object = object
+    rebirthStat.last = nil
+    if not object or not object:IsA("ValueBase") then
+        return
+    end
+    local initial = (object :: any).Value
+    if type(initial) == "number" then
+        rebirthStat.last = initial
+    end
+    rebirthStat.conn = object:GetPropertyChangedSignal("Value"):Connect(function()
+        local current = (object :: any).Value
+        if type(current) ~= "number" then
+            return
+        end
+        local previous = rebirthStat.last
+        rebirthStat.last = current
+        if previous ~= nil and current > previous then
+            beginSettle("rebirth", os.clock() - S.lastCharAddedAt < Config.RecentResetWindow)
+        end
+    end)
+    table.insert(conns, rebirthStat.conn)
+end
+
+-- character handlers
+local function onCharacterAdded(newChar)
+    character = newChar
+    humanoid = newChar:WaitForChild("Humanoid")
+    refreshBackpack()
+    bindCharacterWatchers()
+    bindHumanoid(humanoid)
+    S.lastCharAddedAt = os.clock()
+    beginSettle("respawn", true)
+end
+
+local function onCharacterRemoving()
+    beginSettle("respawn", false)
 end
 
 -- main farm loop
@@ -330,8 +480,8 @@ local function startMainLoop()
     mainThread = task.spawn(function()
         local desired = nil
         while S.running and not S.stopped do
-            if S.respawning or S.paused or S.rebirthCooldown then
-                task.wait(0.1)
+            if S.settling or S.paused then
+                task.wait(0.05)
                 continue
             end
 
@@ -384,7 +534,7 @@ local function startBackgroundLoops()
     -- rep spam
     table.insert(threads, task.spawn(function()
         while not S.stopped do
-            if S.running and not S.paused and not S.respawning and not S.rebirthCooldown then
+            if S.running and not S.paused and not S.settling then
                 R.muscle = R.muscle or player:FindFirstChild("muscleEvent")
                 if R.muscle then
                     pcall(R.muscle.FireServer, R.muscle, "rep")
@@ -419,33 +569,27 @@ local function startBackgroundLoops()
         end
     end))
 
-    -- rebirth
+    -- rebirth: fast requests, never while a reset / tool refresh is in progress
     table.insert(threads, task.spawn(function()
         while not S.stopped do
-            if S.rebirthEnabled and R.rebirth then
-                local ok = pcall(R.rebirth.InvokeServer, R.rebirth, "rebirthRequest")
-                if ok then
-                    S.rebirthCooldown = true
-                    refreshStatus()
-                    task.wait(1)
-                    S.rebirthCooldown = false
-                    refreshStatus()
-                end
+            if S.rebirthEnabled and R.rebirth and not S.settling then
+                pcall(R.rebirth.InvokeServer, R.rebirth, "rebirthRequest")
             end
             task.wait(Config.RebirthInterval)
         end
     end))
 
-    -- housekeeping: position locks every tick, re-equip fallback every ReequipEvery ticks
+    -- housekeeping: Backpack check + position locks every tick, re-equip fallback every ReequipEvery ticks
     table.insert(threads, task.spawn(function()
         local tickCount = 0
         while not S.stopped do
+            refreshBackpack()
             enforceLocks()
             tickCount += 1
             if tickCount % Config.ReequipEvery == 0 then
                 S.toolsDirty = true
                 local target = S.currentTarget
-                if S.running and not S.respawning and not S.paused and not S.rebirthCooldown
+                if S.running and not S.settling and not S.paused
                     and character and target and not findTool(character, target) then
                     task.spawn(tryEquip, target)
                 end
@@ -476,7 +620,9 @@ local function stopEverything()
     S.rebirthEnabled = false
     S.teleLock = false
     S.posLock = false
-    S.rebirthCooldown = false
+    S.settling = false
+    S.settleReason = nil
+    S.settleToken += 1
     S.currentTarget = nil
     bgRunning = false
 
@@ -551,14 +697,13 @@ function OnyxGUI:Destroy()
         pcall(task.cancel, statsThread)
         statsThread = nil
     end
-    for _, c in ipairs(watchConns) do
-        pcall(function() c:Disconnect() end)
+    if humanoidConn then
+        pcall(function() humanoidConn:Disconnect() end)
+        humanoidConn = nil
     end
-    table.clear(watchConns)
-    for _, c in ipairs(conns) do
-        pcall(function() c:Disconnect() end)
-    end
-    table.clear(conns)
+    clearConns(backpackConns)
+    clearConns(characterConns)
+    clearConns(conns)
 end
 getgenv().OnyxGUI = OnyxGUI
 
@@ -614,8 +759,15 @@ if not uiOk then
 end
 
 resolveRemotes()
-bindToolWatchers()
+bindBackpackWatchers()
+bindCharacterWatchers()
+table.insert(conns, player.ChildAdded:Connect(function(child)
+    if child:IsA("Backpack") then
+        refreshBackpack()
+    end
+end))
 table.insert(conns, player.CharacterAdded:Connect(onCharacterAdded))
+table.insert(conns, player.CharacterRemoving:Connect(onCharacterRemoving))
 if player.Character then
     task.spawn(onCharacterAdded, player.Character)
 end
@@ -623,6 +775,7 @@ startBackgroundLoops()
 
 statsThread = task.spawn(function()
     while not destroyed do
+        bindRebirthStat()
         updateStats()
         task.wait(Config.StatsInterval)
     end
