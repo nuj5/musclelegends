@@ -1,0 +1,629 @@
+-- Onyx GUI (muscle farm port). Made by JustH0bo.
+-- Sourced: functions, remotes, arguments, intervals, radii from the original script; UI calls from the Onyx README;
+-- stat names from the leaderboard header screenshot.
+-- ASSUMED: stats live under player.leaderstats as numeric values; Onyx handles are method-style;
+-- Credits field meanings (Name / Title / Label).
+
+for _, key in ipairs({ "OnyxGUI", "Potassium" }) do
+    local old = getgenv()[key]
+    if old then
+        pcall(function() old:Destroy() end)
+    end
+end
+
+local Config = {
+    LibraryUrl           = "https://raw.githubusercontent.com/nuj5/onyx/refs/heads/main/onyx.lua",
+    ToolPriority         = { "Pushups", "Weight" },
+    LockPosition         = Vector3.new(-8741.34, 23.68, -5854.70),
+    TeleLockRadius       = 5,
+    PosLockRadius        = 3,
+    ActivateGap          = 0.1,
+    LoopStep             = 0.05,
+    EquipSettle          = 0.2,
+    RespawnSettle        = 2,
+    RepInterval          = 0.1,
+    HousekeepingInterval = 0.5,
+    ReequipEvery         = 4,    -- housekeeping ticks, 4 x 0.5s = 2s like the original
+    SlowInterval         = 10,   -- gift + size
+    RebirthInterval      = 5,
+    GiftSlots            = 8,
+    StatsFolder          = "leaderstats",                              -- ASSUMED container
+    StatNames            = { "Strength", "Rebirths", "Kills", "Brawls" }, -- from leaderboard header
+    StatsInterval        = 1,
+}
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local player = Players.LocalPlayer
+local backpack = player:WaitForChild("Backpack")
+local character = player.Character
+local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+
+local S = {
+    running = false,
+    paused = false,
+    stopped = false,
+    rebirthEnabled = false,
+    teleLock = false,
+    posLock = false,
+    rebirthCooldown = false,
+    respawning = false,
+    currentTarget = nil,
+    lastActivation = 0,
+    toolsDirty = true,
+    posLockPosition = Vector3.zero,
+}
+
+local R: { [string]: any } = {}    -- remotes, resolved lazily
+local UI: { [string]: any } = {}   -- Onyx control handles
+local lastText: { [string]: string } = {}
+local threads = {}                 -- cancellable farm threads
+local mainThread = nil
+local statsThread = nil
+local bgRunning = false
+local watchConns = {}
+local conns = {}
+local destroyed = false
+local startedAt = os.clock()
+
+-- pure helpers
+local function formatNumber(n)
+    if type(n) ~= "number" or n ~= n or n == math.huge or n == -math.huge then
+        return "n/a"
+    end
+    local sign = n < 0 and "-" or ""
+    local digits = string.format("%.0f", math.abs(n))
+    local grouped = digits:reverse():gsub("(%d%d%d)", "%1,"):reverse()
+    grouped = (grouped:gsub("^,", ""))
+    return sign .. grouped
+end
+
+local function formatDuration(seconds)
+    local total = math.max(0, math.floor(seconds))
+    return string.format("%d:%02d:%02d", total // 3600, (total % 3600) // 60, total % 60)
+end
+
+-- counts increases only, so a reset or drop never shows as negative
+local function accumulateGain(entry, value)
+    if entry.last ~= nil and value > entry.last then
+        entry.gained += value - entry.last
+    end
+    entry.last = value
+end
+
+-- Onyx handle call (method style, assumed)
+local function callHandle(handle, method, ...)
+    local fn = handle and handle[method]
+    if type(fn) ~= "function" then
+        return
+    end
+    local ok, err = pcall(fn, handle, ...)
+    if not ok then
+        warn("[OnyxGUI] " .. method .. " failed: " .. tostring(err))
+    end
+end
+
+local function uiSet(name, value)
+    if UI[name] then
+        callHandle(UI[name], "Set", value, true)
+    end
+end
+
+local function setLabel(key, text)
+    local handle = UI[key]
+    if not handle or lastText[key] == text then
+        return
+    end
+    lastText[key] = text
+    callHandle(handle, "SetText", text)
+end
+
+-- status
+local function computeStatus()
+    if not S.running then return "● IDLE" end
+    if S.paused then return "⏸  PAUSED" end
+    if S.rebirthCooldown then return "✦  REBIRTHING" end
+    if S.currentTarget then return "▶  " .. S.currentTarget:upper() end
+    return "◎  SEARCHING"
+end
+
+local function refreshStatus()
+    setLabel("status", computeStatus())
+end
+
+-- session stats
+local Stats = {}
+for _, name in ipairs(Config.StatNames) do
+    Stats[name] = { last = nil, current = nil, gained = 0 }
+end
+
+local function readStat(name)
+    local folder = player:FindFirstChild(Config.StatsFolder)
+    local object = folder and folder:FindFirstChild(name)
+    if object and object:IsA("ValueBase") then
+        local value = (object :: any).Value
+        if type(value) == "number" and value == value then
+            return value
+        end
+    end
+    return nil
+end
+
+local function updateStats()
+    for _, name in ipairs(Config.StatNames) do
+        local entry = Stats[name]
+        local value = readStat(name)
+        entry.current = value
+        if value ~= nil then
+            accumulateGain(entry, value)
+        end
+        setLabel("stat_" .. name, name .. ": " .. formatNumber(entry.current) .. "  (+" .. formatNumber(entry.gained) .. ")")
+    end
+    setLabel("session", "Session: " .. formatDuration(os.clock() - startedAt))
+end
+
+-- remotes
+local function resolveRemotes()
+    R.muscle = R.muscle or player:FindFirstChild("muscleEvent")
+    local rEvents = ReplicatedStorage:FindFirstChild("rEvents")
+    if rEvents then
+        R.gift    = R.gift    or rEvents:FindFirstChild("freeGiftClaimRemote")
+        R.rebirth = R.rebirth or rEvents:FindFirstChild("rebirthRemote")
+        R.size    = R.size    or rEvents:FindFirstChild("changeSpeedSizeRemote")
+    end
+end
+
+-- tool helpers
+local function findTool(parent, name)
+    if not parent then
+        return nil
+    end
+    local child = parent:FindFirstChild(name)
+    if child and child:IsA("Tool") then
+        return child
+    end
+    return nil
+end
+
+local function isAvailable(name)
+    if not character then
+        return false
+    end
+    return findTool(character, name) ~= nil or findTool(backpack, name) ~= nil
+end
+
+local function resolveDesired()
+    for _, name in ipairs(Config.ToolPriority) do
+        if isAvailable(name) then
+            return name
+        end
+    end
+    return nil
+end
+
+local function tryEquip(name)
+    if not humanoid or not character or S.respawning then
+        return nil
+    end
+    local inChar = findTool(character, name)
+    if inChar then
+        return inChar
+    end
+    local inBag = findTool(backpack, name)
+    if not inBag then
+        return nil
+    end
+    pcall(function() humanoid:EquipTool(inBag) end)
+    task.wait(Config.EquipSettle)
+    return findTool(character, name)
+end
+
+local function unequipAllExcept(name)
+    if not character or not backpack then
+        return
+    end
+    for _, item in ipairs(character:GetChildren()) do
+        if item:IsA("Tool") and item.Name ~= name then
+            pcall(function() item.Parent = backpack end)
+        end
+    end
+end
+
+local function unequipAll()
+    unequipAllExcept(nil)
+end
+
+local function activate(tool)
+    if not tool then
+        return
+    end
+    local now = os.clock()
+    if now - S.lastActivation < Config.ActivateGap then
+        return
+    end
+    S.lastActivation = now
+    pcall(tool.Activate, tool)
+end
+
+local function snapTo(pos)
+    local root = character and character:FindFirstChild("HumanoidRootPart")
+    if root then
+        pcall(function() root.CFrame = CFrame.new(pos) end)
+    end
+end
+
+local function enforceLocks()
+    if not (S.teleLock or S.posLock) then
+        return
+    end
+    if S.paused or S.stopped or S.respawning or not character then
+        return
+    end
+    local root = character:FindFirstChild("HumanoidRootPart")
+    if not root then
+        return
+    end
+    if S.teleLock and (root.Position - Config.LockPosition).Magnitude > Config.TeleLockRadius then
+        snapTo(Config.LockPosition)
+    end
+    if S.posLock and (root.Position - S.posLockPosition).Magnitude > Config.PosLockRadius then
+        snapTo(S.posLockPosition)
+    end
+end
+
+-- tool change watchers (replace per-iteration scans)
+local function bindToolWatchers()
+    for _, c in ipairs(watchConns) do
+        c:Disconnect()
+    end
+    table.clear(watchConns)
+    backpack = player:FindFirstChildOfClass("Backpack") or backpack
+    local function mark()
+        S.toolsDirty = true
+    end
+    local function watch(container)
+        if not container then
+            return
+        end
+        table.insert(watchConns, container.ChildAdded:Connect(mark))
+        table.insert(watchConns, container.ChildRemoved:Connect(mark))
+    end
+    watch(backpack)
+    watch(character)
+    S.toolsDirty = true
+end
+
+-- respawn handler
+local function onCharacterAdded(newChar)
+    character = newChar
+    humanoid = newChar:WaitForChild("Humanoid")
+    S.respawning = true
+    bindToolWatchers()
+    task.wait(Config.RespawnSettle)
+    S.respawning = false
+
+    if S.running and S.currentTarget then
+        task.wait(0.5)
+        tryEquip(S.currentTarget)
+    end
+    if S.teleLock then
+        task.wait(0.3)
+        snapTo(Config.LockPosition)
+    end
+    if S.posLock then
+        task.wait(0.3)
+        snapTo(S.posLockPosition)
+    end
+end
+
+-- main farm loop
+local function startMainLoop()
+    if mainThread then
+        return
+    end
+    S.paused = false
+    S.currentTarget = nil
+    S.lastActivation = 0
+    S.toolsDirty = true
+
+    mainThread = task.spawn(function()
+        local desired = nil
+        while S.running and not S.stopped do
+            if S.respawning or S.paused or S.rebirthCooldown then
+                task.wait(0.1)
+                continue
+            end
+
+            local char = player.Character
+            if not char then
+                task.wait(0.2)
+                continue
+            end
+            if char ~= character or not humanoid or humanoid.Parent ~= char then
+                character = char
+                humanoid = char:FindFirstChildOfClass("Humanoid")
+            end
+            if not humanoid then
+                task.wait(0.2)
+                continue
+            end
+
+            if S.toolsDirty or not desired then
+                S.toolsDirty = false
+                desired = resolveDesired()
+            end
+            if not desired then
+                task.wait(0.5)
+                continue
+            end
+
+            if desired ~= S.currentTarget then
+                unequipAllExcept(desired)
+                S.currentTarget = desired
+                refreshStatus()
+                task.wait(Config.EquipSettle)
+                continue
+            end
+
+            local tool = findTool(character, desired) or tryEquip(desired)
+            activate(tool)
+            task.wait(Config.LoopStep)
+        end
+        mainThread = nil
+    end)
+end
+
+-- background loops
+local function startBackgroundLoops()
+    if bgRunning then
+        return
+    end
+    bgRunning = true
+
+    -- rep spam
+    table.insert(threads, task.spawn(function()
+        while not S.stopped do
+            if S.running and not S.paused and not S.respawning and not S.rebirthCooldown then
+                R.muscle = R.muscle or player:FindFirstChild("muscleEvent")
+                if R.muscle then
+                    pcall(R.muscle.FireServer, R.muscle, "rep")
+                end
+            end
+            task.wait(Config.RepInterval)
+        end
+    end))
+
+    -- free gift + size change (each invoke runs in its own task, one in flight at a time)
+    table.insert(threads, task.spawn(function()
+        local idx, giftBusy, sizeBusy = 1, false, false
+        while not S.stopped do
+            resolveRemotes()
+            if R.gift and not giftBusy then
+                giftBusy = true
+                local slot = idx
+                task.spawn(function()
+                    pcall(R.gift.InvokeServer, R.gift, "claimGift", slot)
+                    giftBusy = false
+                end)
+            end
+            idx = idx % Config.GiftSlots + 1
+            if R.size and not sizeBusy then
+                sizeBusy = true
+                task.spawn(function()
+                    pcall(R.size.InvokeServer, R.size, "changeSize", 1)
+                    sizeBusy = false
+                end)
+            end
+            task.wait(Config.SlowInterval)
+        end
+    end))
+
+    -- rebirth
+    table.insert(threads, task.spawn(function()
+        while not S.stopped do
+            if S.rebirthEnabled and R.rebirth then
+                local ok = pcall(R.rebirth.InvokeServer, R.rebirth, "rebirthRequest")
+                if ok then
+                    S.rebirthCooldown = true
+                    refreshStatus()
+                    task.wait(1)
+                    S.rebirthCooldown = false
+                    refreshStatus()
+                end
+            end
+            task.wait(Config.RebirthInterval)
+        end
+    end))
+
+    -- housekeeping: position locks every tick, re-equip fallback every ReequipEvery ticks
+    table.insert(threads, task.spawn(function()
+        local tickCount = 0
+        while not S.stopped do
+            enforceLocks()
+            tickCount += 1
+            if tickCount % Config.ReequipEvery == 0 then
+                S.toolsDirty = true
+                local target = S.currentTarget
+                if S.running and not S.respawning and not S.paused and not S.rebirthCooldown
+                    and character and target and not findTool(character, target) then
+                    task.spawn(tryEquip, target)
+                end
+            end
+            task.wait(Config.HousekeepingInterval)
+        end
+    end))
+end
+
+-- state setters
+local function startRun()
+    if S.running then
+        return
+    end
+    S.stopped = false
+    S.running = true
+    S.paused = false
+    startMainLoop()
+    startBackgroundLoops()
+    uiSet("Start", true)
+    refreshStatus()
+end
+
+local function stopEverything()
+    S.stopped = true
+    S.running = false
+    S.paused = false
+    S.rebirthEnabled = false
+    S.teleLock = false
+    S.posLock = false
+    S.rebirthCooldown = false
+    S.currentTarget = nil
+    bgRunning = false
+
+    if mainThread then
+        pcall(task.cancel, mainThread)
+        mainThread = nil
+    end
+    for _, t in ipairs(threads) do
+        pcall(task.cancel, t)
+    end
+    table.clear(threads)
+
+    if character then
+        unequipAll()
+    end
+
+    for _, name in ipairs({ "Start", "Pause", "Rebirth", "Lock" }) do
+        uiSet(name, false)
+    end
+    refreshStatus()
+end
+
+local function setPaused(value)
+    if value and not S.running then
+        uiSet("Pause", false)
+        return
+    end
+    if S.paused == value then
+        return
+    end
+    S.paused = value
+    uiSet("Pause", value)
+    refreshStatus()
+end
+
+local function setRebirth(value)
+    if S.rebirthEnabled == value then
+        return
+    end
+    S.rebirthEnabled = value
+    uiSet("Rebirth", value)
+end
+
+-- one button, both locks: teleport to LockPosition, then hold that spot with the position lock
+local function setLock(value)
+    if S.teleLock == value and S.posLock == value then
+        return
+    end
+    if value then
+        local root = character and character:FindFirstChild("HumanoidRootPart")
+        if not root then
+            uiSet("Lock", false)
+            return
+        end
+        snapTo(Config.LockPosition)
+        S.posLockPosition = root.Position
+    end
+    S.teleLock = value
+    S.posLock = value
+    uiSet("Lock", value)
+end
+
+-- lifecycle object (declared before the UI so OnUnload can reach it)
+local OnyxGUI = {}
+function OnyxGUI:Destroy()
+    if destroyed then
+        return
+    end
+    destroyed = true
+    stopEverything()
+    if statsThread then
+        pcall(task.cancel, statsThread)
+        statsThread = nil
+    end
+    for _, c in ipairs(watchConns) do
+        pcall(function() c:Disconnect() end)
+    end
+    table.clear(watchConns)
+    for _, c in ipairs(conns) do
+        pcall(function() c:Disconnect() end)
+    end
+    table.clear(conns)
+end
+getgenv().OnyxGUI = OnyxGUI
+
+-- UI
+local function buildUi()
+    local Onyx = loadstring(game:HttpGet(Config.LibraryUrl))()
+
+    local Window = Onyx:CreateWindow({
+        Id       = "OnyxGUI",
+        Title    = "Onyx GUI",
+        Credits  = { Name = "JustH0bo", Title = "Onyx GUI", Label = "Made by" }, -- field meanings ASSUMED
+        OnUnload = function() OnyxGUI:Destroy() end,
+    })
+
+    local Tab = Window:AddTab("Main")
+
+    local Controls = Tab:AddCard({ Title = "Controls", Subtitle = "farm loop", Column = "Left" })
+    UI.status = Controls:AddLabel({ Text = computeStatus() })
+    UI.Start = Controls:AddToggle({
+        Label = "Start loop", Default = false, Flag = "Start",
+        Callback = function(value)
+            if value then
+                startRun()
+            else
+                stopEverything()
+            end
+        end,
+    })
+    UI.Pause = Controls:AddToggle({
+        Label = "Pause", Default = false, Flag = "Pause",
+        Callback = function(value) setPaused(value) end,
+    })
+    UI.Rebirth = Controls:AddToggle({
+        Label = "Rebirth", Default = false, Flag = "Rebirth",
+        Callback = function(value) setRebirth(value) end,
+    })
+    UI.Lock = Controls:AddToggle({
+        Label = "Tele + pos lock", Default = false, Flag = "Lock",
+        Callback = function(value) setLock(value) end,
+    })
+    Controls:AddButton({ Label = "Stop all", Danger = true, Callback = stopEverything })
+
+    local StatsCard = Tab:AddCard({ Title = "Session stats", Subtitle = "since the script started", Column = "Right" })
+    UI.session = StatsCard:AddLabel({ Text = "Session: 0:00:00" })
+    for _, name in ipairs(Config.StatNames) do
+        UI["stat_" .. name] = StatsCard:AddLabel({ Text = name .. ": ..." })
+    end
+end
+
+local uiOk, uiErr = pcall(buildUi)
+if not uiOk then
+    warn("[OnyxGUI] UI build failed: " .. tostring(uiErr))
+end
+
+resolveRemotes()
+bindToolWatchers()
+table.insert(conns, player.CharacterAdded:Connect(onCharacterAdded))
+if player.Character then
+    task.spawn(onCharacterAdded, player.Character)
+end
+startBackgroundLoops()
+
+statsThread = task.spawn(function()
+    while not destroyed do
+        updateStats()
+        task.wait(Config.StatsInterval)
+    end
+end)
